@@ -1,3 +1,6 @@
+# 리눅스 서버에서 돌아가도록 수정 - 김상민
+# 가우시안 스플래팅용 버전
+
 import argparse
 import os
 import sys
@@ -6,6 +9,9 @@ import numpy as np
 import json
 import torch
 from PIL import Image
+
+from typing import List, Dict, Any
+
 
 sys.path.append(os.path.join(os.getcwd(), "GroundingDINO"))
 sys.path.append(os.path.join(os.getcwd(), "segment_anything"))
@@ -135,9 +141,31 @@ def save_mask_data(output_dir, mask_list, box_list, label_list):
     with open(os.path.join(output_dir, 'mask.json'), 'w') as f:
         json.dump(json_data, f)
 
+def write_masks_to_folder(masks: List[Dict[str, Any]], path: str) -> None:
+    header = "id,area,bbox_x0,bbox_y0,bbox_w,bbox_h,point_input_x,point_input_y,predicted_iou,stability_score,crop_box_x0,crop_box_y0,crop_box_w,crop_box_h"  # noqa
+    metadata = [header]
+    for i, mask_data in enumerate(masks):
+        mask = mask_data["segmentation"]
+        filename = f"{i}.png"
+        cv2.imwrite(os.path.join(path, filename), mask * 255)
+        mask_metadata = [
+            str(i),
+            str(mask_data["area"]),
+            *[str(x) for x in mask_data["bbox"]],
+            *[str(x) for x in mask_data["point_coords"][0]],
+            str(mask_data["predicted_iou"]),
+            str(mask_data["stability_score"]),
+            *[str(x) for x in mask_data["crop_box"]],
+        ]
+        row = ",".join(mask_metadata)
+        metadata.append(row)
+    metadata_path = os.path.join(path, "metadata.csv")
+    with open(metadata_path, "w") as f:
+        f.write("\n".join(metadata))
+
+    return
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser("Grounded-Segment-Anything Demo", add_help=True)
     parser.add_argument("--config", type=str, required=True, help="path to config file")
     parser.add_argument(
@@ -155,7 +183,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_sam_hq", action="store_true", help="using sam-hq for prediction"
     )
-    parser.add_argument("--input_image", type=str, required=True, help="path to image file")
+    parser.add_argument("--input_dir", type=str, required=True, help="path to image directory")
     parser.add_argument("--text_prompt", type=str, required=True, help="text prompt")
     parser.add_argument(
         "--output_dir", "-o", type=str, default="outputs", required=True, help="output directory"
@@ -166,7 +194,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--device", type=str, default="cpu", help="running on cpu only!, default=False")
     args = parser.parse_args()
-
+    
     # cfg
     config_file = args.config  # change the path of the model config file
     grounded_checkpoint = args.grounded_checkpoint  # change the path of the model
@@ -174,66 +202,95 @@ if __name__ == "__main__":
     sam_checkpoint = args.sam_checkpoint
     sam_hq_checkpoint = args.sam_hq_checkpoint
     use_sam_hq = args.use_sam_hq
-    image_path = args.input_image
+    input_dir = args.input_dir
     text_prompt = args.text_prompt
     output_dir = args.output_dir
     box_threshold = args.box_threshold
     text_threshold = args.text_threshold
     device = args.device
 
-    # make dir
-    os.makedirs(output_dir, exist_ok=True)
-    # load image
-    image_pil, image = load_image(image_path)
-    # load model
-    model = load_model(config_file, grounded_checkpoint, device=device)
-
-    # visualize raw image
-    image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
-
-    # run grounding dino model
-    boxes_filt, pred_phrases = get_grounding_output(
-        model, image, text_prompt, box_threshold, text_threshold, device=device
-    )
-
+    print("Loading model...")
+    # load DINO model
+    dino = load_model(config_file, grounded_checkpoint, device=device)
     # initialize SAM
     if use_sam_hq:
         predictor = SamPredictor(sam_hq_model_registry[sam_version](checkpoint=sam_hq_checkpoint).to(device))
     else:
         predictor = SamPredictor(sam_model_registry[sam_version](checkpoint=sam_checkpoint).to(device))
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    predictor.set_image(image)
+    if not os.path.isdir(input_dir):
+        targets = [input_dir]
+    else:
+        targets = [
+            f for f in os.listdir(input_dir) if not os.path.isdir(os.path.join(args.input_dir, f))
+        ]
+        targets = [os.path.join(input_dir, f) for f in targets]
+    
+    # make dir
+    os.makedirs(output_dir, exist_ok=True)
 
-    size = image_pil.size
-    H, W = size[1], size[0]
-    for i in range(boxes_filt.size(0)):
-        boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
-        boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
-        boxes_filt[i][2:] += boxes_filt[i][:2]
+    for index, t in enumerate(targets):
+        # load image
+        image_pil, image = load_image(t)
+        if image is None:
+            print(f"Could not load '{t}' as an image, skipping...")
+            continue
+        
+        # run grounding dino model
+        boxes_filt, pred_phrases = get_grounding_output(
+            dino, image, text_prompt, box_threshold, text_threshold, device=device
+        )
+        image = cv2.imread(t)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        predictor.set_image(image)
+        size = image_pil.size
+        H, W = size[1], size[0]
+        for i in range(boxes_filt.size(0)):
+            boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
+            boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
+            boxes_filt[i][2:] += boxes_filt[i][:2]
+        boxes_filt = boxes_filt.cpu()
+        transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
+        masks, _, _ = predictor.predict_torch(
+            point_coords = None,
+            point_labels = None,
+            boxes = transformed_boxes.to(device),
+            multimask_output = False,
+        )
+        base = os.path.basename(t)
+        base = os.path.splitext(base)[0]
 
-    boxes_filt = boxes_filt.cpu()
-    transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
-
-    masks, _, _ = predictor.predict_torch(
-        point_coords = None,
-        point_labels = None,
-        boxes = transformed_boxes.to(device),
-        multimask_output = False,
-    )
-
-    # draw output image
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image)
-    for mask in masks:
-        show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
-    for box, label in zip(boxes_filt, pred_phrases):
-        show_box(box.numpy(), plt.gca(), label)
-
-    plt.axis('off')
-    plt.savefig(
-        os.path.join(output_dir, "grounded_sam_output.jpg"),
-        bbox_inches="tight", dpi=300, pad_inches=0.0
-    )
-
-    save_mask_data(output_dir, masks, boxes_filt, pred_phrases)
+        final_mask = masks.any(dim=0)        
+        mask = final_mask.cpu().numpy()
+        
+        """
+        #배경 흰색, 마스크 검정색 - COLMAP
+        subtract_color = np.array([255, 255, 255, 0])
+        main_color = np.array([255, 255, 255, 255])
+        h, w = mask.shape[-2:]
+        bg_image = np.full((h, w, 4), main_color, dtype=np.int64)
+        mask_image = mask.reshape(h, w, 1) * subtract_color.reshape(1, 1, -1)
+        final_image = bg_image.copy()
+        final_image -= mask_image
+        """
+        #배경 검정색, 마스크 흰색 - DISK
+        subtract_color = np.array([255, 255, 255, 0])
+        main_color = np.array([0, 0, 0, 255])
+        h, w = mask.shape[-2:]
+        bg_image = np.full((h, w, 4), main_color, dtype=np.int64)
+        mask_image = mask.reshape(h, w, 1) * subtract_color.reshape(1, 1, -1)
+        final_image = bg_image.copy()
+        final_image += mask_image
+        
+        cv2.imwrite(f"{output_dir}/{base}.jpg.png", final_image, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+        """
+        #각자 출력
+        os.makedirs(save_base, exist_ok=True)
+        for i, mask in enumerate(masks):
+            mask = mask.cpu().numpy()
+            color = np.array([255, 255, 255, 1])
+            h, w = mask.shape[-2:]
+            mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+            cv2.imwrite(f"{save_base}/{base}_{i}.jpg", mask_image)
+        """
+        print(f"[{index}/{len(targets)}] Segment Complete.")
+    print("Done!")
